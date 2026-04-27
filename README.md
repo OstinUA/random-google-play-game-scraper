@@ -1,6 +1,24 @@
-# App-Finder
+<div align="center">
+
+<pre>
+       d8888                          8888888888 d8b               888                  
+      d88888                          888        Y8P               888                  
+     d88P888                          888                          888                  
+    d88P 888 88888b.  88888b.         8888888    888 88888b.   .d88888  .d88b.  888d888 
+   d88P  888 888 "88b 888 "88b        888        888 888 "88b d88" 888 d8P  Y8b 888P"   
+  d88P   888 888  888 888  888 888888 888        888 888  888 888  888 88888888 888     
+ d8888888888 888 d88P 888 d88P        888        888 888  888 Y88b 888 Y8b.     888     
+d88P     888 88888P"  88888P"         888        888 888  888  "Y88888  "Y8888  888     
+             888      888                                                               
+             888      888                                                               
+             888      888                                                               
+</pre>
+
+</div>
 
 A high-throughput Python game discovery utility that continuously scrapes Google Play search results, filters by install-range heuristics, and persists deduplicated URLs to local storage and Google Sheets.
+
+[![Gist](https://img.shields.io/badge/gist.github-version_of_this_repository-DCDCDC?style=for-the-badge&logo=github)](https://gist.github.com/OstinUA/4eec53453506f4a9f81d763fc61ddeb5)
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
