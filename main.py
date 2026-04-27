@@ -1,3 +1,4 @@
+# main.py
 import re
 import random
 import string
@@ -20,12 +21,16 @@ STOPWORDS = {
     "the", "and", "for", "with", "your", "from", "this", "that",
     "are", "was", "have", "has", "its", "you", "all", "can",
     "new", "free", "game", "games", "play", "edition", "version",
-    "lite", "pro", "plus", "hd", "vip", "mod",
+    "lite", "pro", "plus", "hd", "vip", "mod", "offline", "online",
+    "app", "apps", "top", "best", "fun", "real", "world", "super",
 }
+
+# How many cycles before resetting seen_tokens to allow re-extraction
+TOKEN_RESET_EVERY = 15
 
 
 def random_query() -> str:
-    """Generate a short random query as a fallback seed."""
+    """Generate a short random query as entropy to discover unknown clusters."""
     style = random.choices(
         ["letters", "syllable", "double_syllable"],
         weights=[2, 3, 2],
@@ -66,14 +71,15 @@ def fetch_details(app_id: str) -> dict | None:
 
 def extract_tokens(app_ids: list[str], seen_tokens: set[str]) -> list[str]:
     """
-    Sample already-discovered app IDs, fetch their titles,
-    and extract new search tokens not yet in seen_tokens.
-    This creates a self-replenishing query pool driven by real content.
+    Sample already-discovered app IDs, fetch their titles and summaries,
+    extract words not yet in seen_tokens.
+    Each extracted word is added to seen_tokens to avoid duplicates
+    until the next periodic reset.
     """
     if not app_ids:
         return []
 
-    sample = random.sample(app_ids, min(40, len(app_ids)))
+    sample = random.sample(app_ids, min(50, len(app_ids)))
     new_tokens: list[str] = []
 
     with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
@@ -84,10 +90,10 @@ def extract_tokens(app_ids: list[str], seen_tokens: set[str]) -> list[str]:
                 continue
             title = details.get("title") or ""
             summary = details.get("summary") or ""
-            # Extract alphabetic words of length 3-12 from title and summary
+            # Extract alphabetic words 3-12 chars from title and summary
             for word in re.findall(r"[a-zA-Z]{3,12}", title + " " + summary):
                 w = word.lower()
-                if w not in STOPWORDS and w not in seen_tokens:
+                if w not in seen_tokens:
                     new_tokens.append(w)
                     seen_tokens.add(w)
 
@@ -96,15 +102,19 @@ def extract_tokens(app_ids: list[str], seen_tokens: set[str]) -> list[str]:
 
 def collect_candidates(seen: set[str], token_pool: list[str]) -> list[str]:
     """
-    Build a query set from two sources:
-      - half from the live token_pool (words extracted from known game titles)
-      - half from random_query() as entropy to discover new clusters
-    Collect app IDs from all queries across sampled locales.
+    Build queries from two sources:
+      - consume tokens from token_pool (popped so pool depletes and triggers refill)
+      - random_query() fills remaining slots as entropy
+    Returns deduplicated app IDs not yet in seen.
     """
     half = max(1, settings.QUERIES_PER_RUN // 2)
 
-    # Draw tokens from pool without removing them (pool is managed in main)
-    pool_queries = set(random.sample(token_pool, min(half, len(token_pool)))) if token_pool else set()
+    # Pop tokens so pool shrinks — this guarantees extract_tokens runs again next cycle
+    consumed: list[str] = []
+    while token_pool and len(consumed) < half:
+        consumed.append(token_pool.pop())
+    pool_queries = set(consumed)
+
     rand_queries = {random_query() for _ in range(settings.QUERIES_PER_RUN - len(pool_queries))}
     queries = pool_queries | rand_queries
 
@@ -124,18 +134,18 @@ def collect_candidates(seen: set[str], token_pool: list[str]) -> list[str]:
         for future in as_completed(futures):
             for item in future.result():
                 app_id = item.get("appId")
-                # Only exclude already-seen IDs; filtering by installs/genre happens later
+                # Filter seen here so iter_games only receives unknown IDs
                 if app_id and app_id not in seen:
                     ids.append(app_id)
             done += 1
             print(f"  search: {done}/{total}", end="\r", flush=True)
 
     print()
-    return list(dict.fromkeys(ids))  # deduplicate while preserving order
+    return list(dict.fromkeys(ids))  # deduplicate, preserve order
 
 
 def iter_games(app_ids: list[str]):
-    """Fetch details for each candidate and yield only those matching genre/install filters."""
+    """Fetch details for each candidate and yield IDs that pass genre/install filters."""
     done = 0
     total = len(app_ids)
     found = 0
@@ -216,11 +226,12 @@ def main() -> None:
     print(f"Already saved: {len(seen)}")
     print(f"Writing to {output}{' + Google Sheet' if sheet else ''}. Stop with Ctrl+C.\n")
 
-    # Token pool: self-replenishing list of words extracted from known game titles
+    # token_pool: consumed each cycle, refilled via extract_tokens when depleted
     token_pool: list[str] = []
+    # seen_tokens: prevents duplicate extraction; reset every TOKEN_RESET_EVERY cycles
     seen_tokens: set[str] = set(STOPWORDS)
 
-    # Snapshot of known IDs used for token extraction (avoids modifying `seen` mid-loop)
+    # known_ids: source for extract_tokens; grows as new games are found
     known_ids: list[str] = list(seen)
 
     buffer: list[str] = []
@@ -248,9 +259,16 @@ def main() -> None:
         while True:
             cycle += 1
 
-            # Replenish token pool when it runs low
+            # Periodically reset seen_tokens so games found in previous rounds
+            # can contribute fresh tokens from their titles again
+            if cycle % TOKEN_RESET_EVERY == 0:
+                seen_tokens.clear()
+                seen_tokens.update(STOPWORDS)
+                print(f"  [cycle {cycle}] token filter reset — ready for re-extraction")
+
+            # Refill pool whenever it runs low
             if len(token_pool) < settings.QUERIES_PER_RUN and known_ids:
-                print(f"[Cycle {cycle}] extracting tokens from {min(40, len(known_ids))} known games...")
+                print(f"  [cycle {cycle}] extracting tokens from {min(50, len(known_ids))} known games...")
                 new_tokens = extract_tokens(known_ids, seen_tokens)
                 token_pool.extend(new_tokens)
                 print(f"  token pool: {len(token_pool)} (+{len(new_tokens)} new)")
@@ -262,15 +280,13 @@ def main() -> None:
             print(f"  candidates: {len(candidates)}")
 
             if not candidates:
-                # Pool exhausted and random queries hit only known IDs — shuffle pool
-                random.shuffle(token_pool)
                 continue
 
             for app_id in iter_games(candidates):
                 if app_id in seen:
                     continue
                 seen.add(app_id)
-                known_ids.append(app_id)  # feed new ID back into the extraction source
+                known_ids.append(app_id)  # feed back so it can yield tokens next extraction
                 buffer.append(app_id)
                 if len(buffer) >= settings.BATCH_SIZE:
                     flush()
