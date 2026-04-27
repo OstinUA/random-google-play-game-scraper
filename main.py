@@ -1,7 +1,6 @@
 # main.py
 import re
 import random
-import string
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -13,37 +12,85 @@ import settings
 
 PLAY_URL = "https://play.google.com/store/apps/details?id={app_id}"
 
-CONSONANTS = "bcdfghjklmnpqrstvwxyz"
-VOWELS = "aeiou"
-
-# Words to skip when extracting tokens from game titles
+# ---------------------------------------------------------------------------
+# Stopwords (TASK 6)
+# ---------------------------------------------------------------------------
+# Significantly expanded. Keeps generic English fillers, app/store boilerplate
+# ("free", "edition", "update", "experience"), generic gaming jargon
+# ("level", "score", "gameplay"), and small/junk tokens out of the dynamic
+# token pool so extracted queries actually carry signal.
 STOPWORDS = {
-    "the", "and", "for", "with", "your", "from", "this", "that",
-    "are", "was", "have", "has", "its", "you", "all", "can",
-    "new", "free", "game", "games", "play", "edition", "version",
-    "lite", "pro", "plus", "hd", "vip", "mod", "offline", "online",
+    # Articles, pronouns, conjunctions, prepositions
+    "the", "and", "for", "with", "your", "from", "this", "that", "they",
+    "them", "their", "there", "these", "those", "what", "when", "where",
+    "while", "which", "will", "would", "could", "should", "been", "being",
+    "more", "most", "some", "such", "into", "onto", "over", "under", "than",
+    "then", "also", "even", "just", "only", "very", "much", "many", "each",
+    "every", "both", "either", "neither", "another", "other", "about",
+    "after", "before", "between", "through", "without", "within", "across",
+    "around", "behind", "beyond", "during", "against",
+    # Auxiliary verbs / common verbs
+    "are", "was", "were", "have", "has", "had", "its", "you", "yours",
+    "all", "any", "can", "may", "must", "shall", "did", "does", "doing",
+    "make", "made", "take", "took", "come", "came", "give", "gave", "get",
+    "got", "see", "saw", "say", "said", "use", "used", "try", "tried",
+    "want", "need", "know", "feel", "look", "find", "show", "help",
+    # App / store boilerplate
+    "new", "free", "game", "games", "play", "playing", "edition", "version",
+    "lite", "pro", "plus", "vip", "mod", "offline", "online", "premium",
+    "deluxe", "ultimate", "official", "original", "classic",
     "app", "apps", "top", "best", "fun", "real", "world", "super",
+    "download", "install", "update", "feature", "features", "store",
+    "experience", "enjoy", "discover", "everyone", "anyone", "anywhere",
+    "anytime", "available", "exclusive", "limited", "special",
+    # Gaming jargon that doesn't carve out useful niches on its own
+    "tap", "click", "swipe", "drag", "drop", "level", "levels", "score",
+    "scores", "high", "easy", "hard", "simple", "amazing", "awesome",
+    "exciting", "addictive", "challenging", "endless", "epic", "ultimate",
+    "gameplay", "graphics", "controls", "modes", "mode", "stage", "stages",
+    "mission", "missions", "achievements", "rewards", "bonus", "daily",
+    "weekly", "event", "events", "season", "ranked", "rank",
+    # Generic adjectives
+    "good", "great", "nice", "fine", "cool", "neat", "clean", "smooth",
+    "perfect", "incredible", "fantastic", "wonderful", "beautiful",
+    "stunning", "gorgeous",
+    # Numbers spelled out / ordinals
+    "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "first", "second", "third", "next", "last", "final",
+    # Time
+    "now", "today", "tomorrow", "year", "years", "month", "week", "day",
+    "hour", "minute", "second", "moment",
+    # Misc filler
+    "please", "thanks", "welcome", "hello", "ready", "start", "begin",
+    "play", "pause", "stop", "exit", "menu", "screen", "page",
 }
 
 # How many cycles before resetting seen_tokens to allow re-extraction
+# of words from games found in earlier rounds.
 TOKEN_RESET_EVERY = 15
 
 
+# ---------------------------------------------------------------------------
+# Query generation (TASKS 3 + 4)
+# ---------------------------------------------------------------------------
+# Replaces the prior random_query() that produced "letters/syllable/double_syllable".
+# Now draws from the curated SEED_WORDS list — every query is at least a real
+# word — and occasionally combines 2-3 tokens into a long-tail phrase to dodge
+# popular single-word results that exceed MAX_INSTALLS.
 def random_query() -> str:
-    """Generate a short random query as entropy to discover unknown clusters."""
+    pool = settings.SEED_WORDS
+    # Distribution: heavy on single words for breadth, but ~half the queries are
+    # 2-3 word combos that target the long tail.
     style = random.choices(
-        ["letters", "syllable", "double_syllable"],
-        weights=[2, 3, 2],
+        ["single", "double", "triple"],
+        weights=[5, 3, 2],
         k=1,
     )[0]
-    if style == "letters":
-        return "".join(random.choices(string.ascii_lowercase, k=random.randint(2, 4)))
-    if style == "syllable":
-        return random.choice(CONSONANTS) + random.choice(VOWELS) + random.choice(CONSONANTS)
-    return (
-        random.choice(CONSONANTS) + random.choice(VOWELS)
-        + random.choice(CONSONANTS) + random.choice(VOWELS)
-    )
+    if style == "single":
+        return random.choice(pool)
+    if style == "double":
+        return f"{random.choice(pool)} {random.choice(pool)}"
+    return f"{random.choice(pool)} {random.choice(pool)} {random.choice(pool)}"
 
 
 def parse_installs(value) -> int:
@@ -55,6 +102,10 @@ def parse_installs(value) -> int:
         return 0
 
 
+# ---------------------------------------------------------------------------
+# Network primitives — every call swallows exceptions and returns an empty /
+# None result so a transient timeout or rate-limit never crashes the main loop.
+# ---------------------------------------------------------------------------
 def fetch_search(query: str, lang: str, country: str, limit: int) -> list:
     try:
         return search(query, lang=lang, country=country, n_hits=limit)
@@ -62,20 +113,28 @@ def fetch_search(query: str, lang: str, country: str, limit: int) -> list:
         return []
 
 
-def fetch_details(app_id: str) -> dict | None:
+def fetch_details(app_id: str, lang: str = "en", country: str = "us") -> dict | None:
     try:
-        return get_app_details(app_id)
+        return get_app_details(app_id, lang=lang, country=country)
     except Exception:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Token extraction (TASK 6)
+# ---------------------------------------------------------------------------
+# Stricter validation: alphabetic-only, 4-15 letters, lowercase, not in
+# the (now much larger) stopword set. Numbers, punctuation, and very short
+# or absurdly long strings never enter the pool.
+_VALID_TOKEN = re.compile(r"^[a-z]{4,15}$")
+
+
+def is_valid_token(word: str) -> bool:
+    return bool(_VALID_TOKEN.match(word)) and word not in STOPWORDS
+
+
 def extract_tokens(app_ids: list[str], seen_tokens: set[str]) -> list[str]:
-    """
-    Sample already-discovered app IDs, fetch their titles and summaries,
-    extract words not yet in seen_tokens.
-    Each extracted word is added to seen_tokens to avoid duplicates
-    until the next periodic reset.
-    """
+    """Sample known app IDs, fetch their text, harvest fresh high-quality tokens."""
     if not app_ids:
         return []
 
@@ -88,28 +147,71 @@ def extract_tokens(app_ids: list[str], seen_tokens: set[str]) -> list[str]:
             details = future.result()
             if not details:
                 continue
-            title = details.get("title") or ""
-            summary = details.get("summary") or ""
-            # Extract alphabetic words 3-12 chars from title and summary
-            for word in re.findall(r"[a-zA-Z]{3,12}", title + " " + summary):
-                w = word.lower()
-                if w not in seen_tokens:
+            text = (details.get("title") or "") + " " + (details.get("summary") or "")
+            for raw in re.findall(r"[A-Za-z]+", text):
+                w = raw.lower()
+                if w in seen_tokens:
+                    continue
+                seen_tokens.add(w)  # mark seen even if rejected — don't re-evaluate
+                if is_valid_token(w):
                     new_tokens.append(w)
-                    seen_tokens.add(w)
 
     return new_tokens
 
 
-def collect_candidates(seen: set[str], token_pool: list[str]) -> list[str]:
-    """
-    Build queries from two sources:
-      - consume tokens from token_pool (popped so pool depletes and triggers refill)
-      - random_query() fills remaining slots as entropy
-    Returns deduplicated app IDs not yet in seen.
+# ---------------------------------------------------------------------------
+# Shared search-task runner — every discovery routine funnels through here so
+# concurrency, error handling, and progress reporting are uniform.
+# ---------------------------------------------------------------------------
+def _run_search_tasks(
+    tasks: list[tuple[str, str, str]],
+    seen: set[str],
+    label: str | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    if not tasks:
+        return []
+    n_hits = limit or settings.SEARCH_LIMIT
+    total = len(tasks)
+    done = 0
+    if label:
+        print(f"  {label}: 0/{total}", end="\r", flush=True)
+
+    ids: list[str] = []
+    with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
+        futures = {
+            executor.submit(fetch_search, q, lang, country, n_hits): (q, lang, country)
+            for q, lang, country in tasks
+        }
+        for future in as_completed(futures):
+            for item in future.result():
+                aid = item.get("appId")
+                if aid and aid not in seen:
+                    ids.append(aid)
+            done += 1
+            if label:
+                print(f"  {label}: {done}/{total}", end="\r", flush=True)
+    if label:
+        print()
+    return list(dict.fromkeys(ids))  # dedupe, preserve order
+
+
+# ---------------------------------------------------------------------------
+# DISCOVERY ROUTINES (modular per requirements)
+# ---------------------------------------------------------------------------
+
+def discover_by_search(seen: set[str], token_pool: list[str]) -> list[str]:
+    """Primary keyword-search discovery (TASKS 3 + 4 + 7).
+
+    Builds queries from a 50/50 mix of (a) dynamic tokens harvested from
+    titles/summaries of already-found games and (b) random_query() draws from
+    the curated SEED_WORDS list (single + long-tail combos). Each query runs
+    against a random subset of the broad SEARCH_LOCALES so soft-launched
+    titles in Tier-2/3 markets get surfaced.
     """
     half = max(1, settings.QUERIES_PER_RUN // 2)
 
-    # Pop tokens so pool shrinks — this guarantees extract_tokens runs again next cycle
+    # Drain the token pool — keeps it shrinking so extract_tokens runs again.
     consumed: list[str] = []
     while token_pool and len(consumed) < half:
         consumed.append(token_pool.pop())
@@ -121,31 +223,95 @@ def collect_candidates(seen: set[str], token_pool: list[str]) -> list[str]:
     locales = random.sample(settings.SEARCH_LOCALES, k=min(4, len(settings.SEARCH_LOCALES)))
     tasks = [(q, lang, country) for q in queries for lang, country in locales]
 
-    ids: list[str] = []
-    done = 0
-    total = len(tasks)
-    print(f"  search: 0/{total}", end="\r", flush=True)
+    return _run_search_tasks(tasks, seen, label="search")
 
+
+def discover_by_developer(developer_name: str, developer_id: str, seen: set[str]) -> list[str]:
+    """More-by-this-developer spidering (TASK 1).
+
+    google-play-scraper has no first-class developer-listing endpoint, so we
+    approximate: search the developer's name, then verify each candidate's
+    `developerId` field matches before returning. Bounded by SPIDER_LIMIT.
+    """
+    if not developer_name or not developer_id:
+        return []
+
+    locales = random.sample(settings.SEARCH_LOCALES, k=min(2, len(settings.SEARCH_LOCALES)))
+    tasks = [(developer_name, lang, country) for lang, country in locales]
+    raw = _run_search_tasks(tasks, seen, label=None, limit=settings.SPIDER_LIMIT)
+    if not raw:
+        return []
+    raw = raw[:settings.SPIDER_LIMIT]
+
+    matching: list[str] = []
     with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_search, q, lang, country, settings.SEARCH_LIMIT): (q, lang, country)
-            for q, lang, country in tasks
-        }
+        futures = {executor.submit(fetch_details, aid): aid for aid in raw}
         for future in as_completed(futures):
-            for item in future.result():
-                app_id = item.get("appId")
-                # Filter seen here so iter_games only receives unknown IDs
-                if app_id and app_id not in seen:
-                    ids.append(app_id)
-            done += 1
-            print(f"  search: {done}/{total}", end="\r", flush=True)
-
-    print()
-    return list(dict.fromkeys(ids))  # deduplicate, preserve order
+            aid = futures[future]
+            d = future.result()
+            if d and d.get("developerId") == developer_id:
+                matching.append(aid)
+    return matching
 
 
+def discover_by_similar(app_details: dict, seen: set[str]) -> list[str]:
+    """Similar / related apps expansion (TASK 2).
+
+    google-play-scraper does not expose a `similar(app_id)` endpoint either, so
+    we approximate it: take the most distinctive non-stopword tokens from the
+    matched game's title and pair them with its `genre`. Searching that
+    combination tightly clusters games in the same niche.
+    """
+    title = app_details.get("title") or ""
+    genre = (app_details.get("genre") or "").lower().strip()
+
+    title_tokens = [
+        t.lower()
+        for t in re.findall(r"[A-Za-z]{4,15}", title)
+        if t.lower() not in STOPWORDS
+    ]
+    if not title_tokens:
+        return []
+
+    queries: set[str] = set()
+    for tok in title_tokens[:3]:
+        queries.add(f"{tok} {genre}".strip() if genre else tok)
+        queries.add(tok)
+
+    locales = random.sample(settings.SEARCH_LOCALES, k=min(2, len(settings.SEARCH_LOCALES)))
+    tasks = [(q, lang, country) for q in queries for lang, country in locales]
+    return _run_search_tasks(tasks, seen, label=None, limit=settings.SPIDER_LIMIT)
+
+
+def discover_by_category(seen: set[str]) -> list[str]:
+    """Category / top-chart discovery (TASK 5).
+
+    Iterates the GAME_* category map in settings, picks one (sometimes two)
+    seed keyword per category, and runs them across multiple locales. Surfaces
+    trending titles in each genre that single-token text search rarely hits.
+    """
+    queries: set[str] = set()
+    for keywords in settings.CATEGORY_SEEDS.values():
+        queries.add(random.choice(keywords))
+    # Add a "new" suffix variant for a subset to bias toward fresh listings —
+    # standing in for the missing top-new-free chart endpoint.
+    sample_cats = random.sample(
+        list(settings.CATEGORY_SEEDS.values()),
+        k=min(5, len(settings.CATEGORY_SEEDS)),
+    )
+    for keywords in sample_cats:
+        queries.add(f"{random.choice(keywords)} new")
+
+    locales = random.sample(settings.SEARCH_LOCALES, k=min(4, len(settings.SEARCH_LOCALES)))
+    tasks = [(q, lang, country) for q in queries for lang, country in locales]
+    return _run_search_tasks(tasks, seen, label="category")
+
+
+# ---------------------------------------------------------------------------
+# Filter pipeline — yields (app_id, details) tuples so callers can spider
+# without a second details fetch.
+# ---------------------------------------------------------------------------
 def iter_games(app_ids: list[str]):
-    """Fetch details for each candidate and yield IDs that pass genre/install filters."""
     done = 0
     total = len(app_ids)
     found = 0
@@ -174,11 +340,14 @@ def iter_games(app_ids: list[str]):
                 continue
 
             found += 1
-            yield app_id
+            yield app_id, details
 
     print()
 
 
+# ---------------------------------------------------------------------------
+# Persistence helpers (unchanged behavior)
+# ---------------------------------------------------------------------------
 def load_existing(path: Path) -> set[str]:
     if not path.exists():
         return set()
@@ -213,6 +382,9 @@ def init_sheet():
         return None
 
 
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 def main() -> None:
     output = Path(settings.OUTPUT_FILE)
     seen = load_existing(output)
@@ -226,12 +398,8 @@ def main() -> None:
     print(f"Already saved: {len(seen)}")
     print(f"Writing to {output}{' + Google Sheet' if sheet else ''}. Stop with Ctrl+C.\n")
 
-    # token_pool: consumed each cycle, refilled via extract_tokens when depleted
     token_pool: list[str] = []
-    # seen_tokens: prevents duplicate extraction; reset every TOKEN_RESET_EVERY cycles
     seen_tokens: set[str] = set(STOPWORDS)
-
-    # known_ids: source for extract_tokens; grows as new games are found
     known_ids: list[str] = list(seen)
 
     buffer: list[str] = []
@@ -255,41 +423,92 @@ def main() -> None:
         print(msg + f" (session total: {total_saved})")
         buffer.clear()
 
+    def process(candidates: list[str]) -> list[tuple[str, dict]]:
+        """Run candidates through filtering, save matches, return matched details."""
+        matched: list[tuple[str, dict]] = []
+        if not candidates:
+            return matched
+        for aid, details in iter_games(candidates):
+            if aid in seen:
+                continue
+            seen.add(aid)
+            known_ids.append(aid)
+            buffer.append(aid)
+            matched.append((aid, details))
+            if len(buffer) >= settings.BATCH_SIZE:
+                flush()
+        return matched
+
     try:
         while True:
             cycle += 1
 
-            # Periodically reset seen_tokens so games found in previous rounds
-            # can contribute fresh tokens from their titles again
+            # Periodic token-filter reset so games found earlier can re-contribute
+            # tokens (their titles may yield new words after the pool turned over).
             if cycle % TOKEN_RESET_EVERY == 0:
                 seen_tokens.clear()
                 seen_tokens.update(STOPWORDS)
                 print(f"  [cycle {cycle}] token filter reset — ready for re-extraction")
 
-            # Refill pool whenever it runs low
             if len(token_pool) < settings.QUERIES_PER_RUN and known_ids:
                 print(f"  [cycle {cycle}] extracting tokens from {min(50, len(known_ids))} known games...")
                 new_tokens = extract_tokens(known_ids, seen_tokens)
                 token_pool.extend(new_tokens)
                 print(f"  token pool: {len(token_pool)} (+{len(new_tokens)} new)")
 
-            print(f"[Cycle {cycle}] collecting candidates "
-                  f"(pool: {len(token_pool)} tokens, seen: {len(seen)})...")
+            print(f"[Cycle {cycle}] discovery (pool: {len(token_pool)}, seen: {len(seen)})")
 
-            candidates = collect_candidates(seen, token_pool)
-            print(f"  candidates: {len(candidates)}")
+            # 1. Primary keyword search
+            search_candidates = discover_by_search(seen, token_pool)
+            print(f"  search candidates: {len(search_candidates)}")
 
-            if not candidates:
+            # 2. Periodic category sweep — runs alongside search every Nth cycle
+            if settings.CATEGORY_INTERVAL and cycle % settings.CATEGORY_INTERVAL == 0:
+                try:
+                    cat_candidates = discover_by_category(seen)
+                    print(f"  category candidates: {len(cat_candidates)}")
+                    seen_local = set(search_candidates)
+                    for c in cat_candidates:
+                        if c not in seen_local:
+                            search_candidates.append(c)
+                            seen_local.add(c)
+                except Exception as e:
+                    # Never let one failed routine kill the loop.
+                    print(f"  category discovery error: {e}")
+
+            if not search_candidates:
                 continue
 
-            for app_id in iter_games(candidates):
-                if app_id in seen:
-                    continue
-                seen.add(app_id)
-                known_ids.append(app_id)  # feed back so it can yield tokens next extraction
-                buffer.append(app_id)
-                if len(buffer) >= settings.BATCH_SIZE:
-                    flush()
+            # 3. Filter primary candidates
+            matched = process(search_candidates)
+
+            # 4. Spider into developer + similar for each freshly matched game
+            if settings.SPIDER_ENABLED and matched:
+                spider_pool: list[str] = []
+                spider_seen: set[str] = set()
+                for aid, details in matched:
+                    dev_id = details.get("developerId")
+                    dev_name = details.get("developer")
+                    try:
+                        for x in discover_by_developer(dev_name, dev_id, seen):
+                            if x not in spider_seen:
+                                spider_pool.append(x)
+                                spider_seen.add(x)
+                    except Exception as e:
+                        print(f"  developer discovery error for {aid}: {e}")
+                    try:
+                        for x in discover_by_similar(details, seen):
+                            if x not in spider_seen:
+                                spider_pool.append(x)
+                                spider_seen.add(x)
+                    except Exception as e:
+                        print(f"  similar discovery error for {aid}: {e}")
+
+                if spider_pool:
+                    print(f"  spider candidates: {len(spider_pool)}")
+                    # depth=1 only — matches found via spidering are NOT spidered
+                    # again this cycle, preventing runaway expansion.
+                    process(spider_pool)
 
     except KeyboardInterrupt:
         print("\nStopping...")
