@@ -2,6 +2,7 @@
 import re
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 
 from google_play_scraper import app as get_app_details
@@ -77,8 +78,47 @@ TOKEN_RESET_EVERY = 15
 # Now draws from the curated SEED_WORDS list — every query is at least a real
 # word — and occasionally combines 2-3 tokens into a long-tail phrase to dodge
 # popular single-word results that exceed MAX_INSTALLS.
+
+# SEED_WORDS contains a few accidental repeats ("tower", "stack", "shoot", ...)
+# which would make random.choice() favour them. Dedupe once at import, keeping
+# the original order so the wordlist stays readable/editable in settings.py.
+SEED_POOL: tuple[str, ...] = tuple(dict.fromkeys(settings.SEED_WORDS))
+
+
+@contextmanager
+def _pool(workers: int | None = None):
+    """Thread pool that drops queued work on Ctrl+C instead of draining it.
+
+    A plain `with ThreadPoolExecutor(...)` blocks on exit until every queued
+    future has run, so interrupting a cycle with hundreds of pending requests
+    could take minutes. Here only the in-flight requests finish.
+    """
+    executor = ThreadPoolExecutor(max_workers=workers or settings.WORKERS)
+    try:
+        yield executor
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+_progress_width = 0
+
+
+def _progress(text: str, end: bool = False) -> None:
+    """Single-line progress output, padded so shorter lines don't leave debris."""
+    global _progress_width
+    print(text.ljust(_progress_width), end="\n" if end else "\r", flush=True)
+    _progress_width = 0 if end else max(_progress_width, len(text))
+
+
+def _line(text: str) -> None:
+    """Print a normal line, overwriting any progress line left hanging."""
+    global _progress_width
+    print(text.ljust(_progress_width))
+    _progress_width = 0
+
+
 def random_query() -> str:
-    pool = settings.SEED_WORDS
+    pool = SEED_POOL
     # Distribution: heavy on single words for breadth, but ~half the queries are
     # 2-3 word combos that target the long tail.
     style = random.choices(
@@ -133,29 +173,45 @@ def is_valid_token(word: str) -> bool:
     return bool(_VALID_TOKEN.match(word)) and word not in STOPWORDS
 
 
-def extract_tokens(app_ids: list[str], seen_tokens: set[str]) -> list[str]:
-    """Sample known app IDs, fetch their text, harvest fresh high-quality tokens."""
+def tokens_of(details: dict) -> tuple[str, ...]:
+    """Unique valid tokens from a listing's title + summary, in order."""
+    text = (details.get("title") or "") + " " + (details.get("summary") or "")
+    words = (w.lower() for w in re.findall(r"[A-Za-z]+", text))
+    return tuple(dict.fromkeys(w for w in words if is_valid_token(w)))
+
+
+def extract_tokens(
+    app_ids: list[str],
+    seen_tokens: set[str],
+    token_cache: dict[str, tuple[str, ...]],
+) -> list[str]:
+    """Sample known app IDs and harvest tokens not yet in the pool.
+
+    Every game we match already had its details fetched by iter_games, so its
+    tokens are cached; only IDs carried over from a previous run (loaded from
+    games.txt / the sheet) need a network round trip. That makes the periodic
+    re-extraction after a token-filter reset essentially free.
+    """
     if not app_ids:
         return []
 
     sample = random.sample(app_ids, min(50, len(app_ids)))
+    missing = [aid for aid in sample if aid not in token_cache]
+
+    if missing:
+        with _pool() as executor:
+            futures = {executor.submit(fetch_details, aid): aid for aid in missing}
+            for future in as_completed(futures):
+                details = future.result()
+                token_cache[futures[future]] = tokens_of(details) if details else ()
+
     new_tokens: list[str] = []
-
-    with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
-        futures = {executor.submit(fetch_details, aid): aid for aid in sample}
-        for future in as_completed(futures):
-            details = future.result()
-            if not details:
+    for aid in sample:
+        for w in token_cache.get(aid, ()):
+            if w in seen_tokens:
                 continue
-            text = (details.get("title") or "") + " " + (details.get("summary") or "")
-            for raw in re.findall(r"[A-Za-z]+", text):
-                w = raw.lower()
-                if w in seen_tokens:
-                    continue
-                seen_tokens.add(w)  # mark seen even if rejected — don't re-evaluate
-                if is_valid_token(w):
-                    new_tokens.append(w)
-
+            seen_tokens.add(w)
+            new_tokens.append(w)
     return new_tokens
 
 
@@ -175,25 +231,23 @@ def _run_search_tasks(
     total = len(tasks)
     done = 0
     if label:
-        print(f"  {label}: 0/{total}", end="\r", flush=True)
+        _progress(f"  {label}: 0/{total}")
 
-    ids: list[str] = []
-    with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
-        futures = {
-            executor.submit(fetch_search, q, lang, country, n_hits): (q, lang, country)
+    ids: dict[str, None] = {}  # ordered set — dedupe as we go
+    with _pool() as executor:
+        futures = [
+            executor.submit(fetch_search, q, lang, country, n_hits)
             for q, lang, country in tasks
-        }
+        ]
         for future in as_completed(futures):
             for item in future.result():
                 aid = item.get("appId")
                 if aid and aid not in seen:
-                    ids.append(aid)
+                    ids[aid] = None
             done += 1
             if label:
-                print(f"  {label}: {done}/{total}", end="\r", flush=True)
-    if label:
-        print()
-    return list(dict.fromkeys(ids))  # dedupe, preserve order
+                _progress(f"  {label}: {done}/{total} (found: {len(ids)})", end=done == total)
+    return list(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -226,36 +280,24 @@ def discover_by_search(seen: set[str], token_pool: list[str]) -> list[str]:
     return _run_search_tasks(tasks, seen, label="search")
 
 
-def discover_by_developer(developer_name: str, developer_id: str, seen: set[str]) -> list[str]:
-    """More-by-this-developer spidering (TASK 1).
+def _spider_locales() -> list[tuple[str, str]]:
+    return random.sample(settings.SEARCH_LOCALES, k=min(2, len(settings.SEARCH_LOCALES)))
+
+
+def developer_queries(app_details: dict) -> list[str]:
+    """Queries for more-by-this-developer spidering (TASK 1).
 
     google-play-scraper has no first-class developer-listing endpoint, so we
-    approximate: search the developer's name, then verify each candidate's
-    `developerId` field matches before returning. Bounded by SPIDER_LIMIT.
+    approximate: search the developer's name and verify each candidate's
+    `developerId` afterwards (see discover_by_spider).
     """
-    if not developer_name or not developer_id:
+    if not app_details.get("developer") or not app_details.get("developerId"):
         return []
-
-    locales = random.sample(settings.SEARCH_LOCALES, k=min(2, len(settings.SEARCH_LOCALES)))
-    tasks = [(developer_name, lang, country) for lang, country in locales]
-    raw = _run_search_tasks(tasks, seen, label=None, limit=settings.SPIDER_LIMIT)
-    if not raw:
-        return []
-    raw = raw[:settings.SPIDER_LIMIT]
-
-    matching: list[str] = []
-    with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
-        futures = {executor.submit(fetch_details, aid): aid for aid in raw}
-        for future in as_completed(futures):
-            aid = futures[future]
-            d = future.result()
-            if d and d.get("developerId") == developer_id:
-                matching.append(aid)
-    return matching
+    return [app_details["developer"]]
 
 
-def discover_by_similar(app_details: dict, seen: set[str]) -> list[str]:
-    """Similar / related apps expansion (TASK 2).
+def similar_queries(app_details: dict) -> list[str]:
+    """Queries for similar / related apps expansion (TASK 2).
 
     google-play-scraper does not expose a `similar(app_id)` endpoint either, so
     we approximate it: take the most distinctive non-stopword tokens from the
@@ -270,17 +312,59 @@ def discover_by_similar(app_details: dict, seen: set[str]) -> list[str]:
         for t in re.findall(r"[A-Za-z]{4,15}", title)
         if t.lower() not in STOPWORDS
     ]
-    if not title_tokens:
-        return []
 
-    queries: set[str] = set()
+    queries: dict[str, None] = {}
     for tok in title_tokens[:3]:
-        queries.add(f"{tok} {genre}".strip() if genre else tok)
-        queries.add(tok)
+        queries[f"{tok} {genre}" if genre else tok] = None
+        queries[tok] = None
+    return list(queries)
 
-    locales = random.sample(settings.SEARCH_LOCALES, k=min(2, len(settings.SEARCH_LOCALES)))
-    tasks = [(q, lang, country) for q in queries for lang, country in locales]
-    return _run_search_tasks(tasks, seen, label=None, limit=settings.SPIDER_LIMIT)
+
+def discover_by_spider(matched: list[tuple[str, dict]], seen: set[str]) -> tuple[list[str], dict[str, dict]]:
+    """Depth-1 spider over every freshly matched game, in two batched waves.
+
+    Fanning out per game meant one thread pool (and one serialized round trip)
+    per match; here all developer queries run in a single wave and all
+    similar-niche queries in another, so a cycle with 30 matches costs two waves
+    instead of sixty. Returns the candidate IDs plus any details already
+    fetched during developer verification, so the filter pass can reuse them.
+    """
+    dev_tasks: dict[tuple[str, str, str], None] = {}
+    sim_tasks: dict[tuple[str, str, str], None] = {}
+    developer_ids: set[str] = set()
+
+    for _aid, details in matched:
+        locales = _spider_locales()
+        for q in developer_queries(details):
+            developer_ids.add(details["developerId"])
+            for lang, country in locales:
+                dev_tasks[(q, lang, country)] = None
+        for q in similar_queries(details):
+            for lang, country in locales:
+                sim_tasks[(q, lang, country)] = None
+
+    candidates: dict[str, None] = {}
+    prefetched: dict[str, dict] = {}
+
+    # Wave 1 — developer names, then verify developerId on each candidate.
+    dev_raw = _run_search_tasks(list(dev_tasks), seen, limit=settings.SPIDER_LIMIT)
+    # Same bound as before the batching: at most SPIDER_LIMIT verifications per match.
+    dev_raw = dev_raw[: settings.SPIDER_LIMIT * max(1, len(matched))]
+    if dev_raw:
+        with _pool() as executor:
+            futures = {executor.submit(fetch_details, aid): aid for aid in dev_raw}
+            for future in as_completed(futures):
+                aid = futures[future]
+                d = future.result()
+                if d and d.get("developerId") in developer_ids:
+                    candidates[aid] = None
+                    prefetched[aid] = d
+
+    # Wave 2 — similar-niche searches; no verification needed.
+    for aid in _run_search_tasks(list(sim_tasks), seen, limit=settings.SPIDER_LIMIT):
+        candidates[aid] = None
+
+    return list(candidates), prefetched
 
 
 def discover_by_category(seen: set[str]) -> list[str]:
@@ -311,38 +395,53 @@ def discover_by_category(seen: set[str]) -> list[str]:
 # Filter pipeline — yields (app_id, details) tuples so callers can spider
 # without a second details fetch.
 # ---------------------------------------------------------------------------
-def iter_games(app_ids: list[str]):
-    done = 0
-    total = len(app_ids)
-    found = 0
-    print(f"  details: 0/{total}", end="\r", flush=True)
+def is_wanted(details: dict) -> bool:
+    genre = (details.get("genre") or "").lower()
+    genre_id = (details.get("genreId") or "").upper()
+    if "game" not in genre and not genre_id.startswith("GAME"):
+        return False
 
-    with ThreadPoolExecutor(max_workers=settings.WORKERS) as executor:
-        futures = {executor.submit(fetch_details, aid): aid for aid in app_ids}
+    installs = parse_installs(details.get("installs"))
+    if installs < settings.MIN_INSTALLS:
+        return False
+    if settings.MAX_INSTALLS and installs > settings.MAX_INSTALLS:
+        return False
+    return True
+
+
+def iter_games(app_ids: list[str], prefetched: dict[str, dict] | None = None):
+    """Yield (app_id, details) for candidates that pass the filters.
+
+    `prefetched` lets callers hand over details they already fetched (the
+    developer spider verifies `developerId`, which needs the full listing
+    anyway) so the same page isn't downloaded twice in one cycle.
+    """
+    prefetched = prefetched or {}
+    total = len(app_ids)
+    done = len(prefetched.keys() & set(app_ids))
+    found = 0
+    _progress(f"  details: {done}/{total}")
+
+    for app_id in app_ids:
+        details = prefetched.get(app_id)
+        if details and is_wanted(details):
+            found += 1
+            yield app_id, details
+
+    pending = [aid for aid in app_ids if aid not in prefetched]
+    with _pool() as executor:
+        futures = {executor.submit(fetch_details, aid): aid for aid in pending}
         for future in as_completed(futures):
             app_id = futures[future]
             details = future.result()
             done += 1
-            print(f"  details: {done}/{total} (matched: {found})", end="\r", flush=True)
+            _progress(f"  details: {done}/{total} (matched: {found})")
 
-            if not details:
-                continue
+            if details and is_wanted(details):
+                found += 1
+                yield app_id, details
 
-            genre = (details.get("genre") or "").lower()
-            genre_id = (details.get("genreId") or "").upper()
-            if "game" not in genre and not genre_id.startswith("GAME"):
-                continue
-
-            installs = parse_installs(details.get("installs"))
-            if installs < settings.MIN_INSTALLS:
-                continue
-            if settings.MAX_INSTALLS and installs > settings.MAX_INSTALLS:
-                continue
-
-            found += 1
-            yield app_id, details
-
-    print()
+    _progress(f"  details: {done}/{total} (matched: {found})", end=True)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +474,7 @@ def init_sheet():
             settings.SERVICE_ACCOUNT_FILE,
             settings.GOOGLE_SHEET_TAB,
         )
-        print(f"Google Sheet: {len(writer.existing)} rows, next B{writer.next_row}")
+        print(f"Google Sheet: {len(writer.existing)} rows, next A{writer.next_row}")
         return writer
     except Exception as e:
         print(f"Google Sheet disabled (error): {e}")
@@ -401,8 +500,10 @@ def main() -> None:
     token_pool: list[str] = []
     seen_tokens: set[str] = set(STOPWORDS)
     known_ids: list[str] = list(seen)
+    token_cache: dict[str, tuple[str, ...]] = {}
 
     buffer: list[str] = []
+    sheet_backlog: list[str] = []  # links a failed sheet write still owes
     total_saved = 0
     cycle = 0
 
@@ -413,26 +514,30 @@ def main() -> None:
         append_links(output, buffer)
         msg = f"  + txt: {len(buffer)}"
         if sheet:
+            # Carry links from an earlier failed write; sheet.append() dedupes,
+            # so retrying can never duplicate a row.
+            sheet_backlog.extend(PLAY_URL.format(app_id=aid) for aid in buffer)
             try:
-                links = [PLAY_URL.format(app_id=aid) for aid in buffer]
-                added = sheet.append(links)
+                added = sheet.append(sheet_backlog)
+                sheet_backlog.clear()
                 msg += f", sheet: {added}"
             except Exception as e:
-                msg += f", sheet error: {e}"
+                msg += f", sheet error ({len(sheet_backlog)} queued for retry): {e}"
         total_saved += len(buffer)
-        print(msg + f" (session total: {total_saved})")
+        _line(msg + f" (session total: {total_saved})")
         buffer.clear()
 
-    def process(candidates: list[str]) -> list[tuple[str, dict]]:
+    def process(candidates: list[str], prefetched: dict[str, dict] | None = None) -> list[tuple[str, dict]]:
         """Run candidates through filtering, save matches, return matched details."""
         matched: list[tuple[str, dict]] = []
         if not candidates:
             return matched
-        for aid, details in iter_games(candidates):
+        for aid, details in iter_games(candidates, prefetched):
             if aid in seen:
                 continue
             seen.add(aid)
             known_ids.append(aid)
+            token_cache[aid] = tokens_of(details)  # details are in hand — reuse later
             buffer.append(aid)
             matched.append((aid, details))
             if len(buffer) >= settings.BATCH_SIZE:
@@ -452,7 +557,7 @@ def main() -> None:
 
             if len(token_pool) < settings.QUERIES_PER_RUN and known_ids:
                 print(f"  [cycle {cycle}] extracting tokens from {min(50, len(known_ids))} known games...")
-                new_tokens = extract_tokens(known_ids, seen_tokens)
+                new_tokens = extract_tokens(known_ids, seen_tokens, token_cache)
                 token_pool.extend(new_tokens)
                 print(f"  token pool: {len(token_pool)} (+{len(new_tokens)} new)")
 
@@ -467,11 +572,9 @@ def main() -> None:
                 try:
                     cat_candidates = discover_by_category(seen)
                     print(f"  category candidates: {len(cat_candidates)}")
-                    seen_local = set(search_candidates)
-                    for c in cat_candidates:
-                        if c not in seen_local:
-                            search_candidates.append(c)
-                            seen_local.add(c)
+                    merged = dict.fromkeys(search_candidates)
+                    merged.update(dict.fromkeys(cat_candidates))
+                    search_candidates = list(merged)
                 except Exception as e:
                     # Never let one failed routine kill the loop.
                     print(f"  category discovery error: {e}")
@@ -484,31 +587,18 @@ def main() -> None:
 
             # 4. Spider into developer + similar for each freshly matched game
             if settings.SPIDER_ENABLED and matched:
-                spider_pool: list[str] = []
-                spider_seen: set[str] = set()
-                for aid, details in matched:
-                    dev_id = details.get("developerId")
-                    dev_name = details.get("developer")
-                    try:
-                        for x in discover_by_developer(dev_name, dev_id, seen):
-                            if x not in spider_seen:
-                                spider_pool.append(x)
-                                spider_seen.add(x)
-                    except Exception as e:
-                        print(f"  developer discovery error for {aid}: {e}")
-                    try:
-                        for x in discover_by_similar(details, seen):
-                            if x not in spider_seen:
-                                spider_pool.append(x)
-                                spider_seen.add(x)
-                    except Exception as e:
-                        print(f"  similar discovery error for {aid}: {e}")
+                try:
+                    spider_pool, spider_details = discover_by_spider(matched, seen)
+                except Exception as e:
+                    # Never let one failed routine kill the loop.
+                    print(f"  spider discovery error: {e}")
+                    spider_pool, spider_details = [], {}
 
                 if spider_pool:
                     print(f"  spider candidates: {len(spider_pool)}")
                     # depth=1 only — matches found via spidering are NOT spidered
                     # again this cycle, preventing runaway expansion.
-                    process(spider_pool)
+                    process(spider_pool, spider_details)
 
     except KeyboardInterrupt:
         print("\nStopping...")

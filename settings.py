@@ -4,8 +4,8 @@
 # are persisted. Tightened bounds target the indie / mid-tier "long tail" rather
 # than blockbuster titles that show up on every popular query.
 # ---------------------------------------------------------------------------
-MIN_INSTALLS = 10_000
-MAX_INSTALLS = 100_000
+MIN_INSTALLS = 500_000
+MAX_INSTALLS = 999_000_000
 
 OUTPUT_FILE = "games.txt"
 
@@ -31,7 +31,7 @@ SPIDER_LIMIT = 30
 # Persistence
 # ---------------------------------------------------------------------------
 GOOGLE_SHEET_ENABLED = True
-GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets//github.com/OstinUA/random-google-play-game-scraper"
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1e4DgVOmWKHEVG0YlqmkYn5g2Yl6QxmggXa_ruGAtaMA/edit?gid=0#gid=0"
 GOOGLE_SHEET_TAB = 0
 SERVICE_ACCOUNT_FILE = "service_account.json"
 
